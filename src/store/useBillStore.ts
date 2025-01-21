@@ -1,40 +1,121 @@
 import { create } from 'zustand';
 import { Bill, BillFilters, CategoryTotal } from '../types';
+import { supabase } from '../lib/supabase';
 
 interface BillStore {
   bills: Bill[];
   filters: BillFilters;
-  addBill: (bill: Omit<Bill, 'id'>) => void;
-  updateBill: (id: string, bill: Partial<Bill>) => void;
-  deleteBill: (id: string) => void;
+  addBill: (bill: Omit<Bill, 'id'>) => Promise<void>;
+  updateBill: (id: string, bill: Partial<Bill>) => Promise<void>;
+  deleteBill: (id: string) => Promise<void>;
   setFilters: (filters: BillFilters) => void;
   getFilteredBills: () => Bill[];
   getCategoryTotals: () => CategoryTotal[];
   getMonthlyTotals: () => { paid: number; unpaid: number };
+  fetchBills: () => Promise<void>;
 }
 
 export const useBillStore = create<BillStore>((set, get) => ({
   bills: [],
   filters: {},
 
-  addBill: (bill) => {
-    set((state) => ({
-      bills: [...state.bills, { ...bill, id: crypto.randomUUID() }],
-    }));
+  fetchBills: async () => {
+    const { data: session } = await supabase.auth.getSession();
+    if (!session.session) return;
+
+    const { data: bills, error } = await supabase
+      .from('bills')
+      .select('*')
+      .order('due_date', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching bills:', error);
+      return;
+    }
+
+    set({ 
+      bills: bills.map(bill => ({
+        ...bill,
+        dueDate: new Date(bill.due_date),
+        isRecurring: bill.is_recurring,
+        paidAmount: bill.paid_amount,
+        recurringDay: bill.recurring_day,
+      })) 
+    });
   },
 
-  updateBill: (id, updatedBill) => {
-    set((state) => ({
-      bills: state.bills.map((bill) =>
-        bill.id === id ? { ...bill, ...updatedBill } : bill
-      ),
-    }));
+  addBill: async (bill) => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      console.error('No authenticated user');
+      return;
+    }
+
+    const { error } = await supabase
+      .from('bills')
+      .insert({
+        name: bill.name,
+        amount: bill.amount,
+        due_date: bill.dueDate.toISOString(),
+        status: bill.status,
+        category: bill.category,
+        is_recurring: bill.isRecurring,
+        paid_amount: bill.paidAmount,
+        recurring_day: bill.recurringDay,
+        user_id: session.user.id,
+      });
+
+    if (error) {
+      console.error('Error adding bill:', error);
+      return;
+    }
+
+    await get().fetchBills();
   },
 
-  deleteBill: (id) => {
-    set((state) => ({
-      bills: state.bills.filter((bill) => bill.id !== id),
-    }));
+  updateBill: async (id, updatedBill) => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+
+    const { error } = await supabase
+      .from('bills')
+      .update({
+        ...(updatedBill.name && { name: updatedBill.name }),
+        ...(updatedBill.amount && { amount: updatedBill.amount }),
+        ...(updatedBill.dueDate && { due_date: updatedBill.dueDate.toISOString() }),
+        ...(updatedBill.status && { status: updatedBill.status }),
+        ...(updatedBill.category && { category: updatedBill.category }),
+        ...(updatedBill.isRecurring !== undefined && { is_recurring: updatedBill.isRecurring }),
+        ...(updatedBill.paidAmount !== undefined && { paid_amount: updatedBill.paidAmount }),
+        ...(updatedBill.recurringDay !== undefined && { recurring_day: updatedBill.recurringDay }),
+      })
+      .eq('id', id)
+      .eq('user_id', session.user.id);
+
+    if (error) {
+      console.error('Error updating bill:', error);
+      return;
+    }
+
+    await get().fetchBills();
+  },
+
+  deleteBill: async (id) => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+
+    const { error } = await supabase
+      .from('bills')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', session.user.id);
+
+    if (error) {
+      console.error('Error deleting bill:', error);
+      return;
+    }
+
+    await get().fetchBills();
   },
 
   setFilters: (filters) => {
@@ -57,7 +138,6 @@ export const useBillStore = create<BillStore>((set, get) => ({
     const totals: Record<string, number> = {};
     
     bills.forEach((bill) => {
-      // Calculate the remaining amount for each bill
       const remainingAmount = bill.status === 'PARTIALLY_PAID' 
         ? bill.amount - (bill.paidAmount || 0)
         : bill.status === 'PAID' 
@@ -69,13 +149,12 @@ export const useBillStore = create<BillStore>((set, get) => ({
       }
     });
 
-    // Convert to array and sort by total
     return Object.entries(totals)
       .map(([category, total]) => ({
         category,
         total,
       }))
-      .sort((a, b) => b.total - a.total); // Sort by total in descending order
+      .sort((a, b) => b.total - a.total);
   },
 
   getMonthlyTotals: () => {
